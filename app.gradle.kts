@@ -11,8 +11,8 @@ android {
         applicationId = "com.ceviri.rustr"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
         ndk {
             // Günümüz telefonlarının hepsi arm64; APK boyutu yarıya iner
             abiFilters += listOf("arm64-v8a")

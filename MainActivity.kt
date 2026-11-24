@@ -23,6 +23,7 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,6 +50,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
     private lateinit var canliTr: TextView
     private lateinit var logView: TextView
     private lateinit var scrollView: ScrollView
+    private lateinit var hizYazi: TextView
+    private lateinit var hizAyar: SeekBar
 
     private lateinit var audioManager: AudioManager
     private lateinit var tts: TextToSpeech
@@ -58,6 +61,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
     private var ttsHazir = false
     private var ceviriPaketiHazir = false
     private var motorHazir = false
+    private var buyukHazir = false
+    private var okumaHizi = 1.2f
     private var calisiyor = false
 
     private var trSesler: List<Voice> = emptyList()
@@ -102,6 +107,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
         canliTr = findViewById(R.id.canliTr)
         logView = findViewById(R.id.log)
         scrollView = findViewById(R.id.scroll)
+        hizYazi = findViewById(R.id.hizYazi)
+        hizAyar = findViewById(R.id.hizAyar)
+
+        // Okuma hızı: 0.8x … 2.0x
+        okumaHizi = prefs.getFloat("hiz", 1.2f)
+        hizAyar.progress = ((okumaHizi - 0.8f) / 0.1f + 0.5f).toInt().coerceIn(0, 12)
+        hizYazisi()
+        hizAyar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, kullanici: Boolean) {
+                okumaHizi = 0.8f + p * 0.1f
+                hizYazisi()
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                prefs.edit().putFloat("hiz", okumaHizi).apply()
+                if (ttsHazir && !calisiyor) {
+                    tts.setSpeechRate(okumaHizi)
+                    tts.speak("Okuma hızı bu şekilde.", TextToSpeech.QUEUE_FLUSH, null, "deneme")
+                }
+            }
+        })
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         tts = TextToSpeech(this, this)
@@ -168,6 +194,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
                 }
             } catch (e: Throwable) {
                 runOnUiThread { durum("Ses modeli yüklenemedi: ${e.message}") }
+                return@Thread
+            }
+            try {
+                motor.buyukModeliYukle()
+                runOnUiThread {
+                    buyukHazir = true
+                    durumGuncelle()
+                }
+            } catch (e: Throwable) {
+                runOnUiThread { durum("Büyük model yüklenemedi, küçük model kullanılacak: ${e.message}") }
             }
         }.start()
     }
@@ -238,6 +274,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
         }
         if (!motor.ceviriBaslat()) return
         calisiyor = true
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, TercumanServisi::class.java))
+        } catch (_: Exception) { }
         bekleyenKonusma = 0
         motor.sustur = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -249,6 +288,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
     private fun durdur() {
         calisiyor = false
         motor.ceviriDurdur()
+        try { stopService(Intent(this, TercumanServisi::class.java)) } catch (_: Exception) { }
         tts.stop()
         bekleyenKonusma = 0
         motor.sustur = false
@@ -387,7 +427,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
         }
         tts.setPitch(perdeler[i % perdeler.size])
         // Konuşmalar birikirse biraz hızlan, geride kalma
-        tts.setSpeechRate(if (bekleyenKonusma >= 2) 1.4f else 1.15f)
+        tts.setSpeechRate(if (bekleyenKonusma >= 2) okumaHizi * 1.25f else okumaHizi)
         bekleyenKonusma++
         val r = tts.speak(turkce, TextToSpeech.QUEUE_ADD, null, "u${konusmaSayac++}")
         if (r != TextToSpeech.SUCCESS) konusmaBitti()
@@ -445,9 +485,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
                 !motorHazir -> "Ses modeli yükleniyor…"
                 !ceviriPaketiHazir -> "Çeviri paketi indiriliyor (ilk seferde internet gerekir)…"
                 !ttsHazir -> "Seslendirme hazırlanıyor…"
+                !buyukHazir -> "Hazır. BAŞLAT'a basabilirsiniz (doğruluk modeli hâlâ yükleniyor…)"
                 else -> "Hazır. BAŞLAT'a basın."
             }
         )
+    }
+
+    private fun hizYazisi() {
+        hizYazi.text = "Okuma hızı: %.1fx".format(okumaHizi)
     }
 
     private fun durum(m: String) {
@@ -455,6 +500,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
     }
 
     override fun onDestroy() {
+        try { stopService(Intent(this, TercumanServisi::class.java)) } catch (_: Exception) { }
         try { motor.kapat() } catch (_: Exception) { }
         tts.shutdown()
         translator.close()

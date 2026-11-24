@@ -9,6 +9,10 @@ import android.os.SystemClock
 import com.k2fsa.sherpa.onnx.EndpointConfig
 import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineNemoEncDecCtcModelConfig
+import com.k2fsa.sherpa.onnx.OfflineRecognizer
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
@@ -53,6 +57,11 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
     private lateinit var extractor: SpeakerEmbeddingExtractor
 
     @Volatile var hazir = false
+        private set
+
+    // İkinci geçiş: cümle bitince büyük ve daha doğru model (GigaAM) ile yeniden dinle
+    private var buyuk: OfflineRecognizer? = null
+    @Volatile var buyukHazir = false
         private set
 
     private val isci = Executors.newSingleThreadExecutor()
@@ -106,6 +115,33 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
             SpeakerEmbeddingExtractorConfig(model = "spk.onnx", numThreads = 2),
         )
         hazir = true
+    }
+
+    /** Büyük (doğru) Rusça modeli yükler. yukle()'den sonra, arka planda çağırın. */
+    fun buyukModeliYukle() {
+        val cfg = OfflineRecognizerConfig(
+            featConfig = FeatureConfig(sampleRate = SR, featureDim = 80),
+            modelConfig = OfflineModelConfig(
+                nemo = OfflineNemoEncDecCtcModelConfig(model = "giga/model.int8.onnx"),
+                tokens = "giga/tokens.txt",
+                numThreads = 4,
+            ),
+            decodingMethod = "greedy_search",
+        )
+        buyuk = OfflineRecognizer(assets, cfg)
+        buyukHazir = true
+    }
+
+    private fun buyukTani(ses: FloatArray): String? {
+        val r = buyuk ?: return null
+        val s = r.createStream()
+        try {
+            s.acceptWaveform(ses, SR)
+            r.decode(s)
+            return r.getResult(s).text.trim()
+        } finally {
+            s.release()
+        }
     }
 
     // ---------------- Dışarıdan kontrol ----------------
@@ -317,7 +353,12 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
                 dinleyici.benimSesimAtlandi(metin, banaBenzerlik)
                 return
             }
-            dinleyici.cumleBitti(metin, kisiBul(iz, sure), banaBenzerlik)
+            // Senin sesin değil: cümleyi büyük modelle yeniden dinle (çok daha doğru)
+            val dogruMetin = if (buyukHazir && sure >= 0.3f) {
+                try { buyukTani(hamSes) } catch (_: Throwable) { null }
+            } else null
+            val sonMetin = if (!dogruMetin.isNullOrBlank()) dogruMetin else metin
+            dinleyici.cumleBitti(sonMetin, kisiBul(iz, sure), banaBenzerlik)
         } catch (e: Throwable) {
             dinleyici.cumleBitti(metin, sonKisi, -1f)
         }
