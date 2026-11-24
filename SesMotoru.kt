@@ -342,10 +342,17 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
                 // Cümle sonunu otomatik anla:
                 //  - konuşmacının kendi duraklama alışkanlığına göre bekleme süresi,
                 //  - cümle "ve, ama, için, ki…" gibi yarım kalan bir kelimeyle bitiyorsa daha uzun bekle.
+                //  - cümle yeterince uzunsa ve tamamlanmış görünüyorsa kısa bir duraklama da yeter
+                //    (akıcı konuşmada cümleler birikip toplu çevrilmesin).
                 val durgun = simdi - sonDegisim
-                val gerekli = if (yarimKaldi(metin)) 2200L else otomatikBekleme(araliklar)
-                val cumleBitti = metin.isNotEmpty() &&
-                    (durgun > gerekli || (parcaOrnek > 15 * SR && durgun > 400))
+                val yarim = yarimKaldi(metin)
+                val parcaSn = parcaOrnek / SR
+                val gerekli = if (yarim) 2200L else otomatikBekleme(araliklar)
+                val cumleBitti = metin.isNotEmpty() && (
+                    durgun > gerekli ||
+                        (!yarim && parcaSn >= 5 && durgun > 400) ||
+                        (parcaSn >= 10 && durgun > 300)
+                    )
                 if (cumleBitti || recognizer.isEndpoint(stream)) {
                     if (metin.isNotEmpty()) {
                         val ses = birlestir(parca)
@@ -371,7 +378,7 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
         if (araliklar.size < 5) return 900L
         val sirali = araliklar.sorted()
         val p75 = sirali[(sirali.size * 3) / 4]
-        return (p75 * 3 / 2 + 200).coerceIn(700L, 1400L)
+        return (p75 * 3 / 2 + 150).coerceIn(600L, 1200L)
     }
 
     private fun yarimKaldi(metin: String): Boolean {
