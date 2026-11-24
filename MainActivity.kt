@@ -1,24 +1,32 @@
 package com.ceviri.rustr
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.google.mlkit.common.model.DownloadConditions
@@ -28,319 +36,426 @@ import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import java.util.Locale
 
-/**
- * Akış:  Mikrofon (Rusça konuşma) -> SpeechRecognizer (ru-RU) -> ML Kit çeviri (ru -> tr)
- *        -> TextToSpeech (Türkçe) -> hoparlör / kulaklık
- *
- * Kulaklık takılıyken: dinleme hiç durmaz, çeviri kulağına okunurken yeni Rusça konuşma da yakalanır.
- * Kulaklık yokken (hoparlör): uygulama kendi Türkçe sesini duymasın diye okuma bitene kadar dinlemeyi bekletir.
- */
-class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru.Dinleyici {
 
-    private lateinit var statusView: TextView
-    private lateinit var audioModeView: TextView
-    private lateinit var toggleButton: Button
-    private lateinit var partialView: TextView
+    private lateinit var durumView: TextView
+    private lateinit var modView: TextView
+    private lateinit var sesIziView: TextView
+    private lateinit var btnSesimiTanit: Button
+    private lateinit var btnKisiSifirla: Button
+    private lateinit var btnBaslat: Button
+    private lateinit var btnBen: Button
+    private lateinit var canliRu: TextView
+    private lateinit var canliTr: TextView
     private lateinit var logView: TextView
     private lateinit var scrollView: ScrollView
 
     private lateinit var audioManager: AudioManager
     private lateinit var tts: TextToSpeech
     private lateinit var translator: Translator
-    private var recognizer: SpeechRecognizer? = null
+    private lateinit var motor: SesMotoru
 
-    private var ttsReady = false
-    private var modelReady = false
-    private var running = false
-    private var isListening = false
+    private var ttsHazir = false
+    private var ceviriPaketiHazir = false
+    private var motorHazir = false
+    private var calisiyor = false
 
-    /** Çevirisi veya seslendirmesi henüz bitmemiş cümle sayısı. */
-    private var pending = 0
-    private var utteranceCounter = 0
+    private var trSesler: List<Voice> = emptyList()
+    private val perdeler = floatArrayOf(1.0f, 0.8f, 1.2f, 0.9f, 1.1f)
+    private val renkler = intArrayOf(
+        0xFF4FC3F7.toInt(), 0xFFFFB74D.toInt(), 0xFF81C784.toInt(),
+        0xFFF06292.toInt(), 0xFFBA68C8.toInt()
+    )
+    private var bekleyenKonusma = 0
+    private var konusmaSayac = 0
+
+    private var anlikCeviriSuruyor = false
+    private var bekleyenAnlik: String? = null
+
+    private var kayitDialog: AlertDialog? = null
+    private var kayitDialogText: TextView? = null
+    private var izinSonrasi: (() -> Unit)? = null
 
     private val handler = Handler(Looper.getMainLooper())
+    private val prefs by lazy { getSharedPreferences("ayarlar", MODE_PRIVATE) }
 
-    private val micPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) start() else setStatus("Mikrofon izni verilmedi. Ayarlardan izin verin.")
+    private val micIzni =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { verildi ->
+            if (verildi) izinSonrasi?.invoke()
+            else durum("Mikrofon izni verilmedi. Ayarlardan izin verin.")
+            izinSonrasi = null
         }
 
+    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        statusView = findViewById(R.id.status)
-        audioModeView = findViewById(R.id.audioMode)
-        toggleButton = findViewById(R.id.toggle)
-        partialView = findViewById(R.id.partial)
+        durumView = findViewById(R.id.durum)
+        modView = findViewById(R.id.mod)
+        sesIziView = findViewById(R.id.sesIzi)
+        btnSesimiTanit = findViewById(R.id.btnSesimiTanit)
+        btnKisiSifirla = findViewById(R.id.btnKisiSifirla)
+        btnBaslat = findViewById(R.id.btnBaslat)
+        btnBen = findViewById(R.id.btnBen)
+        canliRu = findViewById(R.id.canliRu)
+        canliTr = findViewById(R.id.canliTr)
         logView = findViewById(R.id.log)
         scrollView = findViewById(R.id.scroll)
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-
         tts = TextToSpeech(this, this)
-        setupTranslator()
+        motor = SesMotoru(assets, this)
+        ceviriciyiHazirla()
+        motoruYukle()
 
-        toggleButton.setOnClickListener { if (running) stop() else requestStart() }
-        updateAudioModeLabel()
+        btnBaslat.setOnClickListener { if (calisiyor) durdur() else izinleCalistir { baslat() } }
+        btnSesimiTanit.setOnClickListener { izinleCalistir { sesKaydiBaslat() } }
+        btnKisiSifirla.setOnClickListener {
+            motor.kisileriSifirla()
+            logEkle(SpannableStringBuilder("— Yeni konuşma: kişiler sıfırlandı —\n\n").also {
+                it.setSpan(ForegroundColorSpan(Color.GRAY), 0, it.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            })
+        }
+        btnBen.setOnTouchListener { v, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    motor.benKonusuyorum = true
+                    v.isPressed = true
+                    btnBen.text = "🙊 Seni dinlemiyorum… (bırakınca devam)"
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    motor.benKonusuyorum = false
+                    v.isPressed = false
+                    btnBen.text = getString(R.string.ben_konusuyorum)
+                }
+            }
+            true
+        }
+
+        sesIziDurumu()
+        modEtiketi()
+        durumGuncelle()
     }
 
-    // ---------------- Çeviri modeli ----------------
+    // ---------------- Hazırlık ----------------
 
-    private fun setupTranslator() {
+    private fun ceviriciyiHazirla() {
         val options = TranslatorOptions.Builder()
             .setSourceLanguage(TranslateLanguage.RUSSIAN)
             .setTargetLanguage(TranslateLanguage.TURKISH)
             .build()
         translator = Translation.getClient(options)
-
-        setStatus("Çeviri paketi indiriliyor (ilk seferde ~30 MB, internet gerekir)…")
         translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
             .addOnSuccessListener {
-                modelReady = true
-                setStatus(readyText())
+                ceviriPaketiHazir = true
+                durumGuncelle()
             }
             .addOnFailureListener {
-                setStatus("Çeviri paketi indirilemedi. İnternete bağlanıp uygulamayı yeniden açın.")
+                durum("Çeviri paketi indirilemedi. İnternete bağlanıp uygulamayı yeniden açın.")
             }
     }
 
-    // ---------------- Seslendirme (Türkçe) ----------------
+    private fun motoruYukle() {
+        Thread {
+            try {
+                motor.yukle()
+                motor.benimIzlerimiYukle(prefs.getString("benim_izlerim", "") ?: "")
+                runOnUiThread {
+                    motorHazir = true
+                    sesIziDurumu()
+                    durumGuncelle()
+                }
+            } catch (e: Throwable) {
+                runOnUiThread { durum("Ses modeli yüklenemedi: ${e.message}") }
+            }
+        }.start()
+    }
 
     override fun onInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) {
-            setStatus("Telefonda seslendirme motoru bulunamadı (Google Konuşma Hizmetleri gerekli).")
+            durum("Seslendirme motoru bulunamadı (Google Konuşma Hizmetleri gerekli).")
             return
         }
-        val result = tts.setLanguage(Locale("tr", "TR"))
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            setStatus("Türkçe ses paketi yok. Açılan ekrandan Türkçe sesi indirin.")
-            try {
-                startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA))
-            } catch (_: Exception) { }
+        val r = tts.setLanguage(Locale("tr", "TR"))
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+            durum("Türkçe ses paketi yok. Açılan ekrandan Türkçe sesi indirin.")
+            try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) } catch (_: Exception) { }
             return
         }
-        tts.setSpeechRate(1.15f)
         tts.setAudioAttributes(
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
         )
+        trSesler = try {
+            tts.voices
+                ?.filter { it.locale.language == "tr" && !it.isNetworkConnectionRequired }
+                ?.sortedBy { it.name }
+                ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) = runOnUiThread { onUtteranceFinished() }
+            override fun onStart(utteranceId: String?) {
+                if (!kulaklikTakili()) motor.sustur = true
+            }
+            override fun onDone(utteranceId: String?) = runOnUiThread { konusmaBitti() }
             @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) = runOnUiThread { onUtteranceFinished() }
-            override fun onError(utteranceId: String?, errorCode: Int) = runOnUiThread { onUtteranceFinished() }
+            override fun onError(utteranceId: String?) = runOnUiThread { konusmaBitti() }
+            override fun onError(utteranceId: String?, errorCode: Int) = runOnUiThread { konusmaBitti() }
         })
-        ttsReady = true
-        if (modelReady) setStatus(readyText())
+        ttsHazir = true
+        durumGuncelle()
     }
 
-    private fun onUtteranceFinished() {
-        pending = (pending - 1).coerceAtLeast(0)
-        scheduleListen(100)
+    private fun konusmaBitti() {
+        bekleyenKonusma = (bekleyenKonusma - 1).coerceAtLeast(0)
+        if (bekleyenKonusma == 0) {
+            // Hoparlörün yankısı bitsin diye kısa bir bekleme
+            handler.postDelayed({ if (bekleyenKonusma == 0) motor.sustur = false }, 300)
+        }
     }
 
     // ---------------- Başlat / Durdur ----------------
 
-    private fun requestStart() {
+    private fun izinleCalistir(is_: () -> Unit) {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED
-        ) start() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        ) {
+            is_()
+        } else {
+            izinSonrasi = is_
+            micIzni.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
-    private fun start() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            setStatus("Bu telefonda konuşma tanıma yok. Google uygulamasını yükleyip güncelleyin.")
+    private fun baslat() {
+        if (!motorHazir || !ceviriPaketiHazir) {
+            durum("Henüz hazır değil, birkaç saniye bekleyin…")
             return
         }
-        running = true
-        pending = 0
+        if (!motor.ceviriBaslat()) return
+        calisiyor = true
+        bekleyenKonusma = 0
+        motor.sustur = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        toggleButton.text = "DURDUR"
-        updateAudioModeLabel()
-        startListening()
+        btnBaslat.text = "DURDUR"
+        modEtiketi()
+        durum("🎤 Dinleniyor (Rusça)…")
     }
 
-    private fun stop() {
-        running = false
-        handler.removeCallbacksAndMessages(null)
-        recognizer?.destroy()
-        recognizer = null
-        isListening = false
+    private fun durdur() {
+        calisiyor = false
+        motor.ceviriDurdur()
         tts.stop()
-        pending = 0
+        bekleyenKonusma = 0
+        motor.sustur = false
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        toggleButton.text = "BAŞLAT"
-        partialView.text = ""
-        setStatus("Durduruldu.")
+        btnBaslat.text = "BAŞLAT"
+        canliRu.text = ""
+        canliTr.text = ""
+        durum("Durduruldu.")
     }
 
-    // ---------------- Rusça dinleme ----------------
+    // ---------------- Ses izi kaydı ----------------
 
-    /** Kulaklık yoksa, Türkçe okuma bitene kadar mikrofonu açmayız (yankı olmasın). */
-    private fun mustWaitForSpeech(): Boolean = pending > 0 && !headphonesConnected()
-
-    private fun scheduleListen(delayMs: Long) {
-        handler.postDelayed({
-            if (running && !isListening && !mustWaitForSpeech()) startListening()
-        }, delayMs)
-    }
-
-    private fun startListening() {
-        if (!running) return
-        val rec = recognizer ?: SpeechRecognizer.createSpeechRecognizer(this).also {
-            it.setRecognitionListener(listener)
-            recognizer = it
-        }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ru-RU")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            // Kısa duraklamada cümleyi bitmiş say -> daha hızlı çeviri
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-        }
-        isListening = true
-        rec.startListening(intent)
-        updateAudioModeLabel()
-        setStatus("🎤 Dinleniyor (Rusça)…")
-    }
-
-    private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val text = partialResults
-                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-            if (!text.isNullOrBlank()) partialView.text = "🇷🇺 $text…"
-        }
-
-        override fun onResults(results: Bundle?) {
-            isListening = false
-            partialView.text = ""
-            val text = results
-                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-            if (!text.isNullOrBlank()) translateAndSpeak(text)
-            scheduleListen(50)
-        }
-
-        override fun onError(error: Int) {
-            isListening = false
-            when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleListen(50)
-
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
-                SpeechRecognizer.ERROR_CLIENT -> {
-                    recognizer?.destroy()
-                    recognizer = null
-                    scheduleListen(300)
-                }
-
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    stop()
-                    setStatus("Mikrofon izni yok.")
-                }
-
-                SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
-                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> {
-                    stop()
-                    setStatus(
-                        "Rusça konuşma tanıma bu telefonda yok. Ayarlar > Google > Ses > " +
-                            "Çevrimdışı konuşma tanıma bölümünden Rusçayı indirin."
-                    )
-                }
-
-                SpeechRecognizer.ERROR_NETWORK,
-                SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
-                SpeechRecognizer.ERROR_SERVER -> {
-                    setStatus("İnternet sorunu, yeniden deneniyor…")
-                    scheduleListen(1000)
-                }
-
-                else -> scheduleListen(500)
-            }
-        }
-    }
-
-    // ---------------- Çeviri + seslendirme ----------------
-
-    private fun translateAndSpeak(russian: String) {
-        if (!modelReady) {
-            appendLog(russian, "(çeviri paketi henüz hazır değil)")
+    private fun sesKaydiBaslat() {
+        if (!motorHazir) {
+            durum("Ses modeli yükleniyor, birkaç saniye bekleyin…")
             return
         }
-        pending++ // hoparlör modunda dinleme, bu cümle okunana kadar bekler
-        translator.translate(russian)
-            .addOnSuccessListener { turkish ->
-                appendLog(russian, turkish)
-                speak(turkish)
-            }
-            .addOnFailureListener {
-                appendLog(russian, "(çeviri hatası)")
-                onUtteranceFinished()
-            }
+        val tv = TextView(this).apply {
+            setPadding(60, 40, 60, 20)
+            textSize = 17f
+        }
+        kayitDialogText = tv
+        kayitDialogMetni(0)
+        kayitDialog = AlertDialog.Builder(this)
+            .setTitle("Sesimi tanıt")
+            .setView(tv)
+            .setCancelable(false)
+            .setNegativeButton("İptal") { _, _ -> motor.sesKaydiIptal() }
+            .show()
+        if (!motor.sesKaydiBaslat()) kayitDialog?.dismiss()
     }
 
-    private fun speak(text: String) {
-        if (!ttsReady || !running) {
-            onUtteranceFinished()
+    private fun kayitDialogMetni(saniye: Int) {
+        kayitDialogText?.text =
+            "Telefonu normal tuttuğunuz gibi tutun ve ${SesMotoru.KAYIT_SN} saniye boyunca " +
+                "kendi sesinizle konuşun. Örneğin şunu okuyabilirsiniz:\n\n" +
+                "\"Merhaba, benim adım … . Bu uygulama Rusça konuşulanları Türkçeye çeviriyor. " +
+                "Benim sesimi tanıyıp çevirmemesi gerekiyor. Bugün hava güzel, birazdan dışarı çıkacağım.\"\n\n" +
+                "⏺ Kayıt: $saniye / ${SesMotoru.KAYIT_SN} sn"
+    }
+
+    private fun sesIziDurumu() {
+        val n = motor.benimIzSayim()
+        sesIziView.text = if (n > 0)
+            "✅ Ses iziniz kayıtlı ($n örnek). Kendi sesiniz çevrilmeyecek."
+        else
+            "⚠️ Ses iziniz kayıtlı değil. Önce \"Sesimi tanıt\"a basın."
+    }
+
+    private fun izleriKaydet() {
+        prefs.edit().putString("benim_izlerim", motor.benimIzlerimMetin()).apply()
+    }
+
+    // ---------------- Motor olayları (arka plan thread'inden gelir) ----------------
+
+    override fun anlikMetin(rusca: String) = runOnUiThread {
+        canliRu.text = if (rusca.isEmpty()) "" else "🇷🇺 $rusca"
+        anlikCevir(rusca)
+    }
+
+    override fun cumleBitti(rusca: String, kisi: Int, banaBenzerlik: Float) = runOnUiThread {
+        canliRu.text = ""
+        canliTr.text = ""
+        bekleyenAnlik = null
+        translator.translate(rusca)
+            .addOnSuccessListener { turkce ->
+                cumleyiYaz(kisi, rusca, turkce, banaBenzerlik)
+                if (calisiyor) konus(turkce, kisi)
+            }
+            .addOnFailureListener { cumleyiYaz(kisi, rusca, "(çeviri hatası)", banaBenzerlik) }
+    }
+
+    override fun benimSesimAtlandi(rusca: String, banaBenzerlik: Float) = runOnUiThread {
+        canliRu.text = ""
+        canliTr.text = ""
+        bekleyenAnlik = null
+        val s = SpannableStringBuilder("🙊 Sizin sesiniz, çevrilmedi (benzerlik %.2f)\n\n".format(banaBenzerlik))
+        s.setSpan(ForegroundColorSpan(Color.GRAY), 0, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        s.setSpan(RelativeSizeSpan(0.8f), 0, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        logEkle(s)
+    }
+
+    override fun sesKaydiIlerleme(saniye: Int) = runOnUiThread { kayitDialogMetni(saniye) }
+
+    override fun sesKaydiBitti(basarili: Boolean) = runOnUiThread {
+        kayitDialog?.dismiss()
+        kayitDialog = null
+        kayitDialogText = null
+        if (basarili) {
+            izleriKaydet()
+            Toast.makeText(this, "Sesiniz kaydedildi ✓", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Ses kaydı alınamadı, tekrar deneyin.", Toast.LENGTH_SHORT).show()
+        }
+        sesIziDurumu()
+    }
+
+    override fun sesimOgrenildi(ornekSayisi: Int) = runOnUiThread {
+        izleriKaydet()
+        sesIziDurumu()
+    }
+
+    override fun hata(mesaj: String) = runOnUiThread {
+        durum(mesaj)
+        if (calisiyor) durdur()
+    }
+
+    // ---------------- Çeviri ve seslendirme ----------------
+
+    private fun anlikCevir(rusca: String) {
+        if (rusca.isEmpty()) {
+            canliTr.text = ""
+            bekleyenAnlik = null
             return
         }
-        val id = "u${utteranceCounter++}"
-        val r = tts.speak(text, TextToSpeech.QUEUE_ADD, null, id)
-        if (r != TextToSpeech.SUCCESS) onUtteranceFinished()
+        bekleyenAnlik = rusca
+        if (!anlikCeviriSuruyor) anlikCeviriyiCalistir()
     }
 
-    // ---------------- Yardımcılar ----------------
+    private fun anlikCeviriyiCalistir() {
+        val m = bekleyenAnlik ?: return
+        bekleyenAnlik = null
+        anlikCeviriSuruyor = true
+        translator.translate(m).addOnCompleteListener { t ->
+            anlikCeviriSuruyor = false
+            if (t.isSuccessful && canliRu.text.isNotEmpty()) canliTr.text = "🇹🇷 ${t.result}"
+            if (bekleyenAnlik != null) anlikCeviriyiCalistir()
+        }
+    }
 
-    private fun headphonesConnected(): Boolean {
-        val headphoneTypes = setOf(
+    private fun konus(turkce: String, kisi: Int) {
+        if (!ttsHazir) return
+        val i = (kisi - 1).coerceAtLeast(0)
+        if (trSesler.isNotEmpty()) {
+            try { tts.setVoice(trSesler[i % trSesler.size]) } catch (_: Exception) { }
+        }
+        tts.setPitch(perdeler[i % perdeler.size])
+        // Konuşmalar birikirse biraz hızlan, geride kalma
+        tts.setSpeechRate(if (bekleyenKonusma >= 2) 1.4f else 1.15f)
+        bekleyenKonusma++
+        val r = tts.speak(turkce, TextToSpeech.QUEUE_ADD, null, "u${konusmaSayac++}")
+        if (r != TextToSpeech.SUCCESS) konusmaBitti()
+    }
+
+    // ---------------- Ekran yardımcıları ----------------
+
+    private fun cumleyiYaz(kisi: Int, rusca: String, turkce: String, banaBenzerlik: Float) {
+        val renk = renkler[(kisi - 1).coerceAtLeast(0) % renkler.size]
+        val s = SpannableStringBuilder()
+        val bas = s.length
+        s.append("Kişi $kisi: ")
+        s.setSpan(ForegroundColorSpan(renk), bas, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        s.setSpan(StyleSpan(android.graphics.Typeface.BOLD), bas, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        s.append(turkce).append("\n")
+        val alt = s.length
+        val benz = if (banaBenzerlik >= -0.5f) " · size benzerlik %.2f".format(banaBenzerlik) else ""
+        s.append("🇷🇺 $rusca$benz\n\n")
+        s.setSpan(ForegroundColorSpan(Color.GRAY), alt, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        s.setSpan(RelativeSizeSpan(0.8f), alt, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        logEkle(s)
+    }
+
+    private fun logEkle(s: CharSequence) {
+        logView.append(s)
+        if (logView.text.length > 30000) {
+            logView.text = logView.text.subSequence(logView.text.length - 20000, logView.text.length)
+        }
+        scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+    }
+
+    private fun kulaklikTakili(): Boolean {
+        val tipler = setOf(
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
             AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
             AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
             AudioDeviceInfo.TYPE_USB_HEADSET,
-            26 // AudioDeviceInfo.TYPE_BLE_HEADSET (Android 12+)
+            26 // TYPE_BLE_HEADSET
         )
-        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            .any { it.type in headphoneTypes }
+        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { it.type in tipler }
     }
 
-    private fun updateAudioModeLabel() {
-        audioModeView.text = if (headphonesConnected())
+    private fun modEtiketi() {
+        modView.text = if (kulaklikTakili())
             "🎧 Kulaklık modu: kesintisiz dinleme"
         else
-            "🔊 Hoparlör modu: çeviri okunurken dinleme bekler"
+            "🔊 Hoparlör modu: çeviri okunurken dinleme bekler (kulaklık önerilir)"
     }
 
-    private fun readyText(): String =
-        if (modelReady && ttsReady) "Hazır. BAŞLAT'a basın." else "Hazırlanıyor…"
-
-    private fun setStatus(text: String) {
-        statusView.text = text
+    private fun durumGuncelle() {
+        if (calisiyor) return
+        durum(
+            when {
+                !motorHazir -> "Ses modeli yükleniyor…"
+                !ceviriPaketiHazir -> "Çeviri paketi indiriliyor (ilk seferde internet gerekir)…"
+                !ttsHazir -> "Seslendirme hazırlanıyor…"
+                else -> "Hazır. BAŞLAT'a basın."
+            }
+        )
     }
 
-    private fun appendLog(ru: String, tr: String) {
-        logView.append("🇷🇺 $ru\n🇹🇷 $tr\n\n")
-        scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+    private fun durum(m: String) {
+        durumView.text = m
     }
 
     override fun onDestroy() {
-        stop()
+        try { motor.kapat() } catch (_: Exception) { }
         tts.shutdown()
         translator.close()
         super.onDestroy()
