@@ -50,6 +50,19 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
         const val MAX_KISI = 5
         const val KAYIT_SN = 12
         private const val MAX_IZ = 12
+
+        /** Rusçada cümlenin bu kelimelerle bitmesi çok zordur: bunlarla biterse cümle devam ediyordur. */
+        private val YARIM_KELIMELER = setOf(
+            "и", "а", "но", "или", "что", "чтобы", "как", "когда", "если", "потому", "поэтому",
+            "который", "которая", "которое", "которые", "которых", "которого", "которой", "где", "куда",
+            "в", "во", "на", "с", "со", "к", "ко", "по", "за", "из", "от", "до", "для", "о", "об", "обо",
+            "у", "при", "про", "без", "над", "под", "через", "между", "перед", "после", "около",
+            "не", "ни", "бы", "же", "то", "даже", "только", "очень", "самый", "самая", "более", "менее",
+            "мой", "моя", "моё", "мои", "твой", "твоя", "наш", "наша", "ваш", "ваша", "свой", "своя",
+            "этот", "эта", "эти", "тот", "та", "те", "такой", "такая", "такие", "каждый", "весь", "вся", "все",
+            "был", "была", "были", "будет", "будут", "буду", "есть", "хочу", "хочет", "хотел", "могу", "может",
+            "можно", "нужно", "надо", "должен", "должна", "чем", "ещё", "еще", "уже", "тоже", "также", "либо"
+        )
     }
 
     private lateinit var recognizer: OnlineRecognizer
@@ -102,8 +115,8 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
             ),
             endpointConfig = EndpointConfig(
                 rule1 = EndpointRule(false, 2.0f, 0.0f),  // hiç konuşma yoksa 2 sn sonra sıfırla
-                rule2 = EndpointRule(true, 0.5f, 0.0f),   // konuşmadan sonra 0,5 sn duraklama = cümle bitti
-                rule3 = EndpointRule(false, 0.0f, 15.0f), // en fazla 15 sn'lik parça
+                rule2 = EndpointRule(true, 30.0f, 0.0f),  // cümle sonunu aşağıda kendimiz belirliyoruz
+                rule3 = EndpointRule(false, 0.0f, 30.0f), // güvenlik sınırı
             ),
             enableEndpoint = true,
             decodingMethod = "greedy_search",
@@ -247,6 +260,7 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
         var sonSaniye = -1
         var sonMetin = ""
         var sonDegisim = SystemClock.elapsedRealtime()
+        val araliklar = ArrayDeque<Long>() // konuşma içindeki duraklama süreleri (konuşmacıya uyum için)
 
         fun parcayiSifirla() {
             recognizer.reset(stream)
@@ -316,13 +330,23 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
                 val metin = recognizer.getResult(stream).text.trim()
                 val simdi = SystemClock.elapsedRealtime()
                 if (metin != sonMetin) {
+                    val bosluk = simdi - sonDegisim
+                    if (sonMetin.isNotEmpty() && metin.isNotEmpty() && bosluk in 150L..1500L) {
+                        araliklar.addLast(bosluk)
+                        if (araliklar.size > 40) araliklar.removeFirst()
+                    }
                     sonMetin = metin
                     sonDegisim = simdi
                     dinleyici.anlikMetin(metin)
                 }
-                // Uzun ve duraksız konuşmayı, kelime arasındaki kısa boşlukta böl (daha hızlı çeviri)
-                val uzunParca = metin.isNotEmpty() && parcaOrnek > 5 * SR && simdi - sonDegisim > 350
-                if (recognizer.isEndpoint(stream) || uzunParca) {
+                // Cümle sonunu otomatik anla:
+                //  - konuşmacının kendi duraklama alışkanlığına göre bekleme süresi,
+                //  - cümle "ve, ama, için, ki…" gibi yarım kalan bir kelimeyle bitiyorsa daha uzun bekle.
+                val durgun = simdi - sonDegisim
+                val gerekli = if (yarimKaldi(metin)) 2200L else otomatikBekleme(araliklar)
+                val cumleBitti = metin.isNotEmpty() &&
+                    (durgun > gerekli || (parcaOrnek > 15 * SR && durgun > 400))
+                if (cumleBitti || recognizer.isEndpoint(stream)) {
                     if (metin.isNotEmpty()) {
                         val ses = birlestir(parca)
                         isci.execute { cumleyiIsle(metin, ses) }
@@ -339,6 +363,21 @@ class SesMotoru(private val assets: AssetManager, private val dinleyici: Dinleyi
             rec.release()
             calisiyor = false
         }
+    }
+
+    // ---------------- Otomatik cümle sonu ----------------
+
+    private fun otomatikBekleme(araliklar: ArrayDeque<Long>): Long {
+        if (araliklar.size < 5) return 900L
+        val sirali = araliklar.sorted()
+        val p75 = sirali[(sirali.size * 3) / 4]
+        return (p75 * 3 / 2 + 200).coerceIn(700L, 1400L)
+    }
+
+    private fun yarimKaldi(metin: String): Boolean {
+        val kelimeler = metin.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (kelimeler.isEmpty()) return false
+        return kelimeler.last().lowercase() in YARIM_KELIMELER
     }
 
     // ---------------- Ses izi (konuşmacı tanıma) ----------------

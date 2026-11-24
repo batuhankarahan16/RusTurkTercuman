@@ -95,6 +95,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        motor = SesMotoru(assets, this)
 
         durumView = findViewById(R.id.durum)
         modView = findViewById(R.id.mod)
@@ -131,7 +132,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         tts = TextToSpeech(this, this)
-        motor = SesMotoru(assets, this)
         ceviriciyiHazirla()
         motoruYukle()
 
@@ -353,7 +353,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
         canliRu.text = ""
         canliTr.text = ""
         bekleyenAnlik = null
-        translator.translate(rusca)
+        translator.translate(cumleYap(rusca))
             .addOnSuccessListener { turkce ->
                 cumleyiYaz(kisi, rusca, turkce, banaBenzerlik)
                 if (calisiyor) konus(turkce, kisi)
@@ -431,6 +431,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, SesMotoru
         bekleyenKonusma++
         val r = tts.speak(turkce, TextToSpeech.QUEUE_ADD, null, "u${konusmaSayac++}")
         if (r != TextToSpeech.SUCCESS) konusmaBitti()
+    }
+
+    /** Model noktalama koymuyor: baş harfi büyüt, sonuna nokta koy (çeviri daha düzgün olur). */
+    private fun cumleYap(m: String): String {
+        val t = m.trim()
+        if (t.isEmpty()) return t
+        val bas = t.substring(0, 1).uppercase(Locale("ru")) + t.substring(1)
+        return if (bas.last() in ".?!") bas else "$bas."
     }
 
     // ---------------- Ekran yardımcıları ----------------
